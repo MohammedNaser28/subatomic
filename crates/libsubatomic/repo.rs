@@ -273,3 +273,211 @@ pub struct AddReplaceOutput<'a, 'b> {
     pub removed: Vec<Vec<u8>>,
     pub added: Vec<AddPkgOutput>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pkg::parse_filename;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn test_rpm_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../random-rpm-examples/terra-release-44-4.noarch.rpm")
+    }
+
+    fn make_repo() -> (TempDir, TempDir, Repo) {
+        let dir = TempDir::new().unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        let repodata_dir = dir.path().join("repodata");
+        fs::create_dir_all(&repodata_dir).unwrap();
+        let cache = crate::repodata::RepoCache::new("testrepo", cache_dir.path(), &repodata_dir).unwrap();
+        let repo = Repo { dir: dir.path().to_owned(), cache, sig: None, use_appstream: false };
+        (dir, cache_dir, repo)
+    }
+
+    fn copy_rpm(src: &Path, dst_dir: &Path, new_name: &str) -> PathBuf {
+        let dst = dst_dir.join(new_name);
+        fs::copy(src, &dst).unwrap();
+        dst
+    }
+
+    // helper that replicates the dedup filtering inside add_replace without touching
+    // the filesystem or rpm parsing, to keep some tests CC=gcc compatible.
+    fn compute_removed(keys: &[Vec<u8>], paths: &[&Path]) -> (Vec<Vec<u8>>, Vec<PathBuf>) {
+        let parsed_keys = keys
+            .iter()
+            .map(|k| (k, parse_filename(k).unwrap()))
+            .collect::<Vec<_>>();
+        let mut removed = Vec::new();
+        let mut bad = Vec::new();
+        for p in paths {
+            let filename = p.file_name().unwrap().as_bytes();
+            let Some(out) = parse_filename(filename) else {
+                bad.push(p.to_path_buf());
+                continue;
+            };
+            for (k, pk) in &parsed_keys {
+                if pk.name == out.name && pk.arch == out.arch && k.as_slice() != filename {
+                    removed.push((*k).clone());
+                }
+            }
+        }
+        (removed, bad)
+    }
+
+    // ── pure dedup logic (works with CC=gcc) ────────────────────────
+    #[test]
+    fn dedup_removes_prev_same_name_arch() {
+        let keys = vec![b"terra-release-44-4.noarch.rpm".to_vec()];
+        let p2 = Path::new("terra-release-44-5.noarch.rpm");
+        let (removed, bad) = compute_removed(&keys, &[p2]);
+        assert!(bad.is_empty());
+        assert_eq!(removed, vec![b"terra-release-44-4.noarch.rpm".to_vec()]);
+    }
+
+    #[test]
+    fn dedup_keeps_different_arch() {
+        let keys = vec![b"myapp-1.0-1.x86_64.rpm".to_vec()];
+        let p2 = Path::new("myapp-1.0-1.aarch64.rpm");
+        let (removed, _) = compute_removed(&keys, &[p2]);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn dedup_keeps_different_name() {
+        let keys = vec![b"foo-1.0-1.noarch.rpm".to_vec()];
+        let p2 = Path::new("bar-1.0-1.noarch.rpm");
+        let (removed, _) = compute_removed(&keys, &[p2]);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn dedup_same_filename_not_removed() {
+        let keys = vec![b"dup-1.0-1.noarch.rpm".to_vec()];
+        let p = Path::new("dup-1.0-1.noarch.rpm");
+        let (removed, _) = compute_removed(&keys, &[p]);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn dedup_bad_filename_collected() {
+        let keys = vec![];
+        let bad = Path::new("bad.rpm");
+        let (removed, bad_list) = compute_removed(&keys, &[bad]);
+        assert!(removed.is_empty());
+        assert_eq!(bad_list, vec![bad.to_path_buf()]);
+    }
+
+    #[test]
+    fn dedup_with_epoch_still_matches_name_arch() {
+        let keys = vec![b"pkg-1:1.0-1.noarch.rpm".to_vec()];
+        let p = Path::new("pkg-2:1.0-1.noarch.rpm");
+        let (removed, _) = compute_removed(&keys, &[p]);
+        assert_eq!(removed, vec![b"pkg-1:1.0-1.noarch.rpm".to_vec()]);
+    }
+
+    // ── integration tests requiring CC=clang (rpm/zstd) ─────────────
+    #[test]
+    fn add_replace_removes_prev_same_name_arch() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+        let p1 = copy_rpm(&src, dir.path(), "terra-release-44-4.noarch.rpm");
+        let p1_slice = [p1.as_path()];
+        repo.add(&p1_slice).unwrap();
+        assert_eq!(repo.cache.keys().unwrap().len(), 1);
+
+        let p2 = copy_rpm(&src, dir.path(), "terra-release-44-5.noarch.rpm");
+        let p2_slice = [p2.as_path()];
+        let out = repo.add_replace(&p2_slice).unwrap();
+        assert_eq!(out.bad_filenames.len(), 0);
+        assert_eq!(out.removed, vec![b"terra-release-44-4.noarch.rpm".to_vec()]);
+        assert_eq!(out.added.len(), 1);
+        let keys = repo.cache.keys().unwrap();
+        assert_eq!(keys, vec![b"terra-release-44-5.noarch.rpm".to_vec()]);
+        assert!(!dir.path().join("terra-release-44-4.noarch.rpm").exists());
+    }
+
+    #[test]
+    fn add_replace_keeps_different_arch() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+        let p1 = copy_rpm(&src, dir.path(), "myapp-1.0-1.x86_64.rpm");
+        repo.add(&[p1.as_path()]).unwrap();
+        let p2 = copy_rpm(&src, dir.path(), "myapp-1.0-1.aarch64.rpm");
+        let p2_slice = [p2.as_path()];
+        let out = repo.add_replace(&p2_slice).unwrap();
+        assert!(out.removed.is_empty());
+        assert_eq!(repo.cache.keys().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn add_replace_keeps_different_name() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+        let p1 = copy_rpm(&src, dir.path(), "foo-1.0-1.noarch.rpm");
+        repo.add(&[p1.as_path()]).unwrap();
+        let p2 = copy_rpm(&src, dir.path(), "bar-1.0-1.noarch.rpm");
+        let p2_slice = [p2.as_path()];
+        let out = repo.add_replace(&p2_slice).unwrap();
+        assert!(out.removed.is_empty());
+        assert_eq!(repo.cache.keys().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn add_replace_same_filename_not_removed() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+        let p1 = copy_rpm(&src, dir.path(), "dup-1.0-1.noarch.rpm");
+        repo.add(&[p1.as_path()]).unwrap();
+        let p1_slice = [p1.as_path()];
+        let out = repo.add_replace(&p1_slice).unwrap();
+        assert!(out.removed.is_empty());
+    }
+
+    #[test]
+    fn add_replace_bad_filename_collected() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+        let bad_path = dir.path().join("bad.rpm");
+        fs::copy(&src, &bad_path).unwrap();
+        let bad_slice = [bad_path.as_path()];
+        let out = repo.add_replace(&bad_slice).unwrap();
+        assert_eq!(out.bad_filenames.len(), 1);
+        assert_eq!(out.bad_filenames[0] as &Path, bad_path.as_path());
+    }
+
+    #[test]
+    fn add_replace_removes_multiple_old_versions() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+        let p1 = copy_rpm(&src, dir.path(), "multi-1.0-1.noarch.rpm");
+        let p2 = copy_rpm(&src, dir.path(), "multi-1.0-2.noarch.rpm");
+        repo.add(&[p1.as_path(), p2.as_path()]).unwrap();
+        let p3 = copy_rpm(&src, dir.path(), "multi-1.0-3.noarch.rpm");
+        let p3_slice = [p3.as_path()];
+        let out = repo.add_replace(&p3_slice).unwrap();
+        assert_eq!(out.removed.len(), 2);
+        assert!(out.removed.contains(&b"multi-1.0-1.noarch.rpm".to_vec()));
+        assert!(out.removed.contains(&b"multi-1.0-2.noarch.rpm".to_vec()));
+        assert_eq!(repo.cache.keys().unwrap(), vec![b"multi-1.0-3.noarch.rpm".to_vec()]);
+    }
+
+    #[test]
+    fn add_replace_mixed_good_and_bad() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+        let p1 = copy_rpm(&src, dir.path(), "alpha-1.0-1.noarch.rpm");
+        repo.add(&[p1.as_path()]).unwrap();
+        let p2 = copy_rpm(&src, dir.path(), "alpha-1.0-2.noarch.rpm");
+        let bad_valid = dir.path().join("bad.rpm");
+        fs::copy(&src, &bad_valid).unwrap();
+        let mixed = [p2.as_path(), bad_valid.as_path()];
+        let out = repo.add_replace(&mixed).unwrap();
+        assert_eq!(out.bad_filenames.len(), 1);
+        assert_eq!(out.removed, vec![b"alpha-1.0-1.noarch.rpm".to_vec()]);
+        let mut keys = repo.cache.keys().unwrap();
+        keys.sort();
+        assert!(keys.contains(&b"alpha-1.0-2.noarch.rpm".to_vec()));
+        assert!(keys.contains(&b"bad.rpm".to_vec()));
+    }
+}
