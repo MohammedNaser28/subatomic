@@ -624,4 +624,102 @@ mod tests {
         assert!(rpm1.exists());
         assert!(rpm2.exists());
     }
+
+    #[test]
+    fn regenerate_ignores_non_rpm_files() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+
+        let rpm = copy_rpm(&src, dir.path(), "valid-1.0-1.noarch.rpm");
+        // Non-RPM files that must be ignored by regenerate().
+        fs::write(dir.path().join("notes.txt"), b"hello").unwrap();
+        fs::write(dir.path().join("archive.zip"), b"PK").unwrap();
+        fs::write(dir.path().join("valid-1.0-1.noarch.rpm.bak"), b"backup").unwrap();
+        // Also ensure .rpm extension is case-insensitive but .rpm.bak is not counted.
+        fs::write(dir.path().join("README"), b"no extension").unwrap();
+
+        let out = repo.regenerate(false).unwrap();
+
+        assert_eq!(out.parsed, 1);
+        assert_eq!(out.cached, 0);
+        assert_eq!(repo.cache.keys().unwrap(), vec![b"valid-1.0-1.noarch.rpm".to_vec()]);
+        assert!(rpm.exists());
+        // Non-RPM files still exist on filesystem and were not ingested.
+        assert!(dir.path().join("notes.txt").exists());
+        assert!(dir.path().join("archive.zip").exists());
+        assert!(dir.path().join("valid-1.0-1.noarch.rpm.bak").exists());
+    }
+
+    #[test]
+    fn del_cache_miss_does_not_delete_filesystem_file() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+
+        // Create a file on the filesystem WITHOUT adding it to the cache.
+        // This simulates an orphan file that is not tracked.
+        let orphan_path = dir.path().join("orphan-1.0-1.noarch.rpm");
+        fs::copy(&src, &orphan_path).unwrap();
+        assert!(orphan_path.exists());
+        assert!(repo.cache.keys().unwrap().is_empty());
+
+        let id: &[u8] = b"orphan-1.0-1.noarch.rpm";
+        let ids = [id];
+        let not_found = repo.del(&ids).unwrap();
+
+        // Cache miss: file must NOT be deleted, and id returned as not_found.
+        assert_eq!(not_found, vec![id]);
+        assert!(orphan_path.exists(), "filesystem file must survive cache miss");
+        assert!(repo.cache.keys().unwrap().is_empty());
+    }
+
+    #[test]
+    fn del_mixed_found_and_missing_only_deletes_found() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+
+        let tracked = copy_rpm(&src, dir.path(), "tracked-1.0-1.noarch.rpm");
+        repo.add(&[tracked.as_path()]).unwrap();
+        assert_eq!(repo.cache.keys().unwrap().len(), 1);
+
+        // Orphan file not in cache.
+        let orphan_path = dir.path().join("orphan-1.0-1.noarch.rpm");
+        fs::copy(&src, &orphan_path).unwrap();
+
+        let tracked_id: &[u8] = b"tracked-1.0-1.noarch.rpm";
+        let orphan_id: &[u8] = b"orphan-1.0-1.noarch.rpm";
+        let ids = [tracked_id, orphan_id];
+        let not_found = repo.del(&ids).unwrap();
+
+        // Only orphan should be reported as not_found; tracked must be deleted.
+        assert_eq!(not_found, vec![orphan_id]);
+        assert!(!tracked.exists());
+        assert!(orphan_path.exists());
+        assert!(repo.cache.keys().unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_outside_repo_dir_returns_strip_prefix_error() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+
+        // Create an RPM file outside the repository directory.
+        let outside_dir = TempDir::new().unwrap();
+        let outside_rpm = copy_rpm(&src, outside_dir.path(), "outside-1.0-1.noarch.rpm");
+        assert!(outside_rpm.exists());
+        // Sanity: outside path is not under repo.dir
+        assert!(!outside_rpm.starts_with(&repo.dir));
+
+        let result = repo.add(&[outside_rpm.as_path()]);
+
+        assert!(result.is_err(), "adding RPM outside repo dir must fail");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("should be in") || err_msg.contains("strip_prefix"),
+            "error should mention strip_prefix/should be in, got: {err_msg}"
+        );
+        // Repo cache unchanged, and original outside file untouched.
+        assert!(repo.cache.keys().unwrap().is_empty());
+        assert!(outside_rpm.exists());
+        assert!(!dir.path().join("outside-1.0-1.noarch.rpm").exists());
+    }
 }

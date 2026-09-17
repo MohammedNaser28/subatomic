@@ -1003,4 +1003,84 @@ mod tests {
         assert!(!path.exists());
         assert!(cache.read_custom_datatype("group").unwrap().is_none());
     }
+
+    #[test]
+    fn update_frags_mixed_purge_removes_stale_from_all_dbs() {
+        let (_repodata_dir, _cache_dir, cache) = make_cache();
+
+        let stale_key: &[u8] = b"stale-1.0-1.noarch.rpm";
+        let cached_key: &[u8] = b"cached-1.0-1.noarch.rpm";
+        let new_key: &[u8] = b"new-1.0-1.noarch.rpm";
+
+        // Stale: inserted but will NOT be sent on channel -> must be purged.
+        // Give it distinct content including appstream so we can verify app DB purge.
+        let stale_frag = FragEph {
+            pri: Frag(Some(b"<pri-stale/>".to_vec())),
+            fil: Frag(Some(b"<fil-stale/>".to_vec())),
+            oth: Frag(Some(b"<oth-stale/>".to_vec())),
+            app: Frag(Some(b"<app-stale/>".to_vec())),
+        };
+        cache.insert_fragments(std::iter::once((stale_key, stale_frag))).unwrap();
+
+        // Cached: inserted then refreshed via None (cached path) -> must survive.
+        let cached_frag = FragEph {
+            pri: Frag(Some(b"<pri-cached/>".to_vec())),
+            fil: Frag(Some(b"<fil-cached/>".to_vec())),
+            oth: Frag(Some(b"<oth-cached/>".to_vec())),
+            app: Frag(Some(b"<app-cached/>".to_vec())),
+        };
+        cache.insert_fragments(std::iter::once((cached_key, cached_frag))).unwrap();
+
+        // Verify preconditions: all fragments present.
+        {
+            let txn = cache.env.read_txn().unwrap();
+            assert_eq!(cache.db_pri.get(&txn, stale_key).unwrap(), Some(&b"<pri-stale/>"[..]));
+            assert_eq!(cache.db_app.get(&txn, stale_key).unwrap(), Some(&b"<app-stale/>"[..]));
+            assert_eq!(cache.db_pri.get(&txn, cached_key).unwrap(), Some(&b"<pri-cached/>"[..]));
+        }
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+
+        // New package -> Some(frag)
+        let new_frag = FragEph {
+            pri: Frag(Some(b"<pri-new/>".to_vec())),
+            fil: Frag(Some(b"<fil-new/>".to_vec())),
+            oth: Frag(Some(b"<oth-new/>".to_vec())),
+            app: Frag(Some(b"<app-new/>".to_vec())),
+        };
+        tx.send((PathBuf::from("new-1.0-1.noarch.rpm"), Some(new_frag))).unwrap();
+
+        // Cached package -> None (incremental reuse)
+        tx.send((PathBuf::from("cached-1.0-1.noarch.rpm"), None)).unwrap();
+
+        drop(tx);
+
+        let (new, cached) = cache.update_frags(&rx).unwrap();
+        assert_eq!(new, 1);
+        assert_eq!(cached, 1);
+
+        // Stale must be removed from epo AND all frag DBs.
+        assert!(!cache.has(stale_key).unwrap());
+        assert!(cache.has(cached_key).unwrap());
+        assert!(cache.has(new_key).unwrap());
+
+        let txn = cache.env.read_txn().unwrap();
+        // Stale purged from all 4 frag DBs.
+        assert_eq!(cache.db_pri.get(&txn, stale_key).unwrap(), None);
+        assert_eq!(cache.db_fil.get(&txn, stale_key).unwrap(), None);
+        assert_eq!(cache.db_oth.get(&txn, stale_key).unwrap(), None);
+        assert_eq!(cache.db_app.get(&txn, stale_key).unwrap(), None);
+
+        // Cached survived (epoch bumped, frags untouched).
+        assert_eq!(cache.db_pri.get(&txn, cached_key).unwrap(), Some(&b"<pri-cached/>"[..]));
+        assert_eq!(cache.db_app.get(&txn, cached_key).unwrap(), Some(&b"<app-cached/>"[..]));
+
+        // New stored correctly.
+        assert_eq!(cache.db_pri.get(&txn, new_key).unwrap(), Some(&b"<pri-new/>"[..]));
+        assert_eq!(cache.db_fil.get(&txn, new_key).unwrap(), Some(&b"<fil-new/>"[..]));
+        assert_eq!(cache.db_oth.get(&txn, new_key).unwrap(), Some(&b"<oth-new/>"[..]));
+        assert_eq!(cache.db_app.get(&txn, new_key).unwrap(), Some(&b"<app-new/>"[..]));
+
+        assert_eq!(cache.len().unwrap(), 2);
+    }
 }
