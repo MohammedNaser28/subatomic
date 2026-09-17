@@ -265,12 +265,7 @@ mod tests {
 
     #[test]
     fn datatype_roundtrip_known() {
-        for dt in [
-            DataType::Primary,
-            DataType::Filelists,
-            DataType::Other,
-            DataType::Appstream,
-        ] {
+        for dt in [DataType::Primary, DataType::Filelists, DataType::Other, DataType::Appstream] {
             let s = ser(&dt);
             let back: DataType = de(&s).unwrap();
             assert_eq!(ser(&back), s);

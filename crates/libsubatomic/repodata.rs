@@ -743,3 +743,153 @@ impl FragEph {
             .expect("cannot serialize");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::fmt::Write as FmtWrite;
+    use std::io::Write as IoWrite;
+    use tempfile::TempDir;
+    fn test_frag() -> FragEph {
+        FragEph {
+            pri: Frag(Some(b"<pri/>".to_vec())),
+            fil: Frag(Some(b"<fil/>".to_vec())),
+            oth: Frag(Some(b"<oth/>".to_vec())),
+            app: Frag::default(),
+        }
+    }
+    fn make_cache() -> (TempDir, TempDir, RepoCache) {
+        let repodata_dir = TempDir::new().unwrap();
+        let cache_dir = TempDir::new().unwrap();
+
+        let cache = RepoCache::new("testrepo", cache_dir.path(), repodata_dir.path()).unwrap();
+
+        (repodata_dir, cache_dir, cache)
+    }
+
+    #[test]
+    fn cache_starts_empty() {
+        let (_repodata_dir, _cache_dir, cache) = make_cache();
+
+        assert!(cache.is_empty().unwrap());
+        assert_eq!(cache.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn cache_has_inserted_package() {
+        let (_repodata_dir, _cache_dir, cache) = make_cache();
+
+        let key = b"testpkg-1.0-1.noarch.rpm";
+
+        cache.insert_fragments(std::iter::once((key.as_slice(), FragEph::default()))).unwrap();
+
+        assert!(cache.has(key).unwrap());
+        assert_eq!(cache.len().unwrap(), 1);
+        assert!(!cache.is_empty().unwrap());
+    }
+
+    #[test]
+    fn delete_pkgs_returns_missing_keys() {
+        let (_repodata_dir, _cache_dir, cache) = make_cache();
+
+        let existing: &[u8] = b"existing-1.0-1.noarch.rpm";
+        let missing: &[u8] = b"missing-1.0-1.noarch.rpm";
+
+        cache.insert_fragments(std::iter::once((existing, FragEph::default()))).unwrap();
+
+        let ids = [existing, missing];
+
+        let not_found = cache.delete_pkgs(&ids).unwrap();
+
+        assert_eq!(not_found, vec![missing]);
+        assert!(!cache.has(existing).unwrap());
+        assert!(!cache.has(missing).unwrap());
+        assert!(cache.is_empty().unwrap());
+    }
+
+    #[test]
+    fn prune_removes_unexpected_packages() {
+        let (_repodata_dir, _cache_dir, cache) = make_cache();
+
+        let keep: &[u8] = b"keep-1.0-1.noarch.rpm";
+        let remove: &[u8] = b"remove-1.0-1.noarch.rpm";
+
+        cache.insert_fragments([(keep, FragEph::default()), (remove, FragEph::default())]).unwrap();
+
+        let expected = HashSet::from([keep]);
+
+        let removed = cache.prune(&expected).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(cache.has(keep).unwrap());
+        assert!(!cache.has(remove).unwrap());
+        assert_eq!(cache.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn repo_writer_csum_sha256() {
+        let mut csum = RepoWriterCsum::Sha256(sha2::Sha256::new());
+
+        csum.write_all(b"hello world").unwrap();
+
+        assert_eq!(csum.csum(), "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+    }
+
+    #[test]
+    fn frag_write_str_appends_data() {
+        let mut frag = Frag::default();
+
+        write!(&mut frag, "hello {}", "world").unwrap();
+        write!(&mut frag, "!").unwrap();
+
+        assert_eq!(frag.0.as_deref(), Some(&b"hello world!"[..]));
+    }
+    #[test]
+    fn update_frags_removes_stale_packages() {
+        let (_repodata_dir, _cache_dir, cache) = make_cache();
+
+        let stale_key: &[u8] = b"stale-1.0-1.noarch.rpm";
+
+        cache.insert_fragments(std::iter::once((stale_key, test_frag()))).unwrap();
+
+        assert!(cache.has(stale_key).unwrap());
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        drop(tx);
+
+        let (new, cached) = cache.update_frags(&rx).unwrap();
+        assert_eq!(new, 0);
+        assert_eq!(cached, 0);
+
+        assert!(!cache.has(stale_key).unwrap());
+    }
+    #[test]
+    fn update_frags_counts_new_and_cached() {
+        let (_repodata_dir, _cache_dir, cache) = make_cache();
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+
+        let new_key: &[u8] = b"new-1.0-1.noarch.rpm";
+        let cached_key: &[u8] = b"cached-1.0-1.noarch.rpm";
+
+        // Put the cached package in the cache first.
+        cache.insert_fragments(std::iter::once((cached_key, test_frag()))).unwrap();
+
+        // New package.
+        tx.send((PathBuf::from("new-1.0-1.noarch.rpm"), Some(test_frag()))).unwrap();
+
+        // Already cached package.
+        tx.send((PathBuf::from("cached-1.0-1.noarch.rpm"), None)).unwrap();
+
+        drop(tx);
+
+        let (new, cached) = cache.update_frags(&rx).unwrap();
+
+        assert_eq!(new, 1);
+        assert_eq!(cached, 1);
+
+        assert!(cache.has(new_key).unwrap());
+        assert!(cache.has(cached_key).unwrap());
+    }
+}

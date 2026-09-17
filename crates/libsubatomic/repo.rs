@@ -282,7 +282,8 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_rpm_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../random-rpm-examples/terra-release-44-4.noarch.rpm")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../random-rpm-examples/terra-release-44-4.noarch.rpm")
     }
 
     fn make_repo() -> (TempDir, TempDir, Repo) {
@@ -290,7 +291,8 @@ mod tests {
         let cache_dir = TempDir::new().unwrap();
         let repodata_dir = dir.path().join("repodata");
         fs::create_dir_all(&repodata_dir).unwrap();
-        let cache = crate::repodata::RepoCache::new("testrepo", cache_dir.path(), &repodata_dir).unwrap();
+        let cache =
+            crate::repodata::RepoCache::new("testrepo", cache_dir.path(), &repodata_dir).unwrap();
         let repo = Repo { dir: dir.path().to_owned(), cache, sig: None, use_appstream: false };
         (dir, cache_dir, repo)
     }
@@ -304,10 +306,7 @@ mod tests {
     // helper that replicates the dedup filtering inside add_replace without touching
     // the filesystem or rpm parsing, to keep some tests CC=gcc compatible.
     fn compute_removed(keys: &[Vec<u8>], paths: &[&Path]) -> (Vec<Vec<u8>>, Vec<PathBuf>) {
-        let parsed_keys = keys
-            .iter()
-            .map(|k| (k, parse_filename(k).unwrap()))
-            .collect::<Vec<_>>();
+        let parsed_keys = keys.iter().map(|k| (k, parse_filename(k).unwrap())).collect::<Vec<_>>();
         let mut removed = Vec::new();
         let mut bad = Vec::new();
         for p in paths {
@@ -479,5 +478,150 @@ mod tests {
         keys.sort();
         assert!(keys.contains(&b"alpha-1.0-2.noarch.rpm".to_vec()));
         assert!(keys.contains(&b"bad.rpm".to_vec()));
+    }
+
+    #[test]
+    fn del_removes_existing_package() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+
+        let rpm = copy_rpm(&src, dir.path(), "testpkg-1.0-1.noarch.rpm");
+        repo.add(&[rpm.as_path()]).unwrap();
+
+        assert!(rpm.exists());
+        assert_eq!(repo.cache.keys().unwrap().len(), 1);
+
+        let id: &[u8] = b"testpkg-1.0-1.noarch.rpm";
+        let binding = [id];
+        let not_found = repo.del(&binding).unwrap();
+
+        assert!(not_found.is_empty());
+        assert!(!rpm.exists());
+        assert!(repo.cache.keys().unwrap().is_empty());
+    }
+    #[test]
+    fn datatypes_without_appstream() {
+        let (_, _, repo) = make_repo();
+
+        let datatypes = repo.datatypes();
+
+        assert_eq!(datatypes.len(), 3);
+        assert!(matches!(datatypes[0], crate::repodata::repomd::DataType::Primary));
+        assert!(matches!(datatypes[1], crate::repodata::repomd::DataType::Filelists));
+        assert!(matches!(datatypes[2], crate::repodata::repomd::DataType::Other));
+    }
+
+    #[test]
+    fn datatypes_with_appstream() {
+        let (_, _, mut repo) = make_repo();
+        repo.use_appstream = true;
+
+        let datatypes = repo.datatypes();
+
+        assert_eq!(datatypes.len(), 4);
+        assert!(matches!(datatypes[0], crate::repodata::repomd::DataType::Primary));
+        assert!(matches!(datatypes[1], crate::repodata::repomd::DataType::Filelists));
+        assert!(matches!(datatypes[2], crate::repodata::repomd::DataType::Other));
+        assert!(matches!(datatypes[3], crate::repodata::repomd::DataType::Appstream));
+    }
+    #[test]
+    fn del_returns_missing_package() {
+        let (_dir, _cache_dir, repo) = make_repo();
+
+        let id: &[u8] = b"missing-1.0-1.noarch.rpm";
+        let ids = [id];
+
+        let not_found = repo.del(&ids).unwrap();
+
+        assert_eq!(not_found, vec![id]);
+    }
+    #[test]
+    fn regenerate_adds_packages_to_cache() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+
+        let rpm = copy_rpm(&src, dir.path(), "testpkg-1.0-1.noarch.rpm");
+
+        assert!(repo.cache.keys().unwrap().is_empty());
+
+        let out = repo.regenerate(false).unwrap();
+
+        assert_eq!(out.parsed, 1);
+        assert_eq!(out.cached, 0);
+        assert!(out.removed == 0);
+
+        assert_eq!(repo.cache.keys().unwrap(), vec![b"testpkg-1.0-1.noarch.rpm".to_vec()]);
+        assert!(rpm.exists());
+    }
+    #[test]
+    fn regenerate_incremental_uses_cached_package() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+
+        let rpm = copy_rpm(&src, dir.path(), "testpkg-1.0-1.noarch.rpm");
+
+        repo.regenerate(false).unwrap();
+
+        let out = repo.regenerate(true).unwrap();
+
+        assert_eq!(out.parsed, 0);
+        assert_eq!(out.cached, 1);
+        assert_eq!(out.removed, 0);
+        assert!(out.skipped.is_empty());
+
+        assert_eq!(repo.cache.keys().unwrap(), vec![b"testpkg-1.0-1.noarch.rpm".to_vec()]);
+        assert!(rpm.exists());
+    }
+
+    #[test]
+    fn regenerate_incremental_removes_deleted_package() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+
+        let rpm = copy_rpm(&src, dir.path(), "testpkg-1.0-1.noarch.rpm");
+
+        repo.regenerate(false).unwrap();
+        assert_eq!(repo.cache.keys().unwrap().len(), 1);
+
+        fs::remove_file(&rpm).unwrap();
+
+        let out = repo.regenerate(true).unwrap();
+
+        assert_eq!(out.parsed, 0);
+        assert_eq!(out.cached, 0);
+        assert_eq!(out.removed, 1);
+        assert!(out.skipped.is_empty());
+
+        assert!(repo.cache.keys().unwrap().is_empty());
+    }
+
+    #[test]
+    fn regenerate_incremental_adds_new_and_keeps_cached() {
+        let (dir, _cache_dir, repo) = make_repo();
+        let src = test_rpm_path();
+
+        let rpm1 = copy_rpm(&src, dir.path(), "testpkg-1.0-1.noarch.rpm");
+
+        repo.regenerate(false).unwrap();
+
+        let rpm2 = copy_rpm(&src, dir.path(), "otherpkg-1.0-1.noarch.rpm");
+
+        let out = repo.regenerate(true).unwrap();
+
+        assert_eq!(out.parsed, 1);
+        assert_eq!(out.cached, 1);
+        assert_eq!(out.removed, 0);
+        assert!(out.skipped.is_empty());
+
+        let mut keys = repo.cache.keys().unwrap();
+        keys.sort();
+
+        assert_eq!(
+            keys,
+            vec![b"otherpkg-1.0-1.noarch.rpm".to_vec(), b"testpkg-1.0-1.noarch.rpm".to_vec(),]
+        );
+
+        assert!(rpm1.exists());
+        assert!(rpm2.exists());
     }
 }
