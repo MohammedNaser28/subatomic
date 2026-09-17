@@ -892,4 +892,115 @@ mod tests {
         assert!(cache.has(new_key).unwrap());
         assert!(cache.has(cached_key).unwrap());
     }
+    #[test]
+    fn insert_fragments_stores_appstream() {
+        let (_repodata_dir, _cache_dir, cache) = make_cache();
+
+        let key = b"test-key";
+
+        let frag = FragEph {
+            pri: Frag(Some(b"<primary/>".to_vec())),
+            fil: Frag(Some(b"<filelists/>".to_vec())),
+            oth: Frag(Some(b"<other/>".to_vec())),
+            app: Frag(Some(b"<components/>".to_vec())),
+        };
+
+        cache.insert_fragments([(key, frag)]).unwrap();
+
+        let txn = cache.env.read_txn().unwrap();
+
+        assert_eq!(cache.db_app.get(&txn, key).unwrap(), Some(&b"<components/>"[..]));
+    }
+    #[test]
+    fn custom_datatype_lifecycle() {
+        let (_repodata_dir, _cache_dir, cache) = crate::repodata::tests::make_cache();
+
+        let dt = "group";
+        let data = crate::repodata::repomd::Data {
+            r#type: repomd::DataType::Custom(dt.into(), "comps.xml".into()),
+            checksum: repomd::Checksum { r#type: repomd::CsumType::Sha256, sha: "abc123".into() },
+            open_checksum: repomd::Checksum {
+                r#type: repomd::CsumType::Sha256,
+                sha: "def456".into(),
+            },
+            location: repomd::Location { href: "repodata/abc123-group-comps.xml.zst".into() },
+            timestamp: 123,
+            size: 100,
+            open_size: 200,
+        };
+
+        // Write
+        cache.write_custom_datatype(&data).unwrap();
+
+        // Read
+        let stored = cache.read_custom_datatype(dt).unwrap().unwrap();
+        assert_eq!(stored.checksum.sha, "abc123");
+        assert_eq!(stored.open_checksum.sha, "def456");
+        assert_eq!(stored.size, 100);
+        assert_eq!(stored.open_size, 200);
+
+        // Delete
+        let deleted = cache.del_custom_datatype(dt).unwrap().unwrap();
+        assert_eq!(deleted.checksum.sha, "abc123");
+
+        // Verify deletion
+        assert!(cache.read_custom_datatype(dt).unwrap().is_none());
+    }
+    #[test]
+    fn update_custom_datatype_writes_file_and_cache() {
+        let (repodata_dir, _cache_dir, cache) = make_cache();
+
+        let dt = repomd::DataType::Custom("group".into(), "comps.xml".into());
+        let buf = b"<comps><group/></comps>";
+
+        cache.update_custom_datatype(dt.clone(), buf).unwrap();
+
+        // The metadata should have been stored in the cache.
+        let data = cache.read_custom_datatype("group").unwrap().unwrap();
+
+        assert_eq!(data.r#type.as_type(), "group");
+        assert_eq!(data.open_size, buf.len() as u64);
+
+        // update_custom_datatype renames the temporary file to this final path.
+        let final_path =
+            repodata_dir.path().join(format!("{}-{}.zst", data.checksum.sha, data.r#type));
+
+        assert!(final_path.exists());
+
+        // The temporary file should no longer exist.
+        let temp_path = repodata_dir.path().join(format!("{}.zst", dt.as_str()));
+
+        assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn del_custom_datatype_removes_file() {
+        let (repodata_dir, _cache_dir, cache) = make_cache();
+
+        let data = repomd::Data {
+            r#type: repomd::DataType::Custom("group".into(), "comps.xml".into()),
+            checksum: repomd::Checksum { r#type: repomd::CsumType::Sha256, sha: "abc123".into() },
+            open_checksum: repomd::Checksum {
+                r#type: repomd::CsumType::Sha256,
+                sha: "def456".into(),
+            },
+            location: repomd::Location { href: "repodata/abc123-group-comps.xml.zst".into() },
+            timestamp: 123,
+            size: 100,
+            open_size: 200,
+        };
+
+        cache.write_custom_datatype(&data).unwrap();
+
+        let path = repodata_dir.path().join(format!("{}-{}.zst", data.checksum.sha, data.r#type));
+
+        std::fs::write(&path, b"test").unwrap();
+        assert!(path.exists());
+
+        let deleted = cache.del_custom_datatype("group").unwrap();
+
+        assert!(deleted.is_some());
+        assert!(!path.exists());
+        assert!(cache.read_custom_datatype("group").unwrap().is_none());
+    }
 }
