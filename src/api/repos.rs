@@ -1,7 +1,4 @@
 #![allow(clippy::missing_errors_doc)]
-use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
-
 use crate::db::{Key, Repo};
 use crate::error::{ApiError, Result};
 use crate::validate::{md_filename, repo_name, rpm_filename};
@@ -12,8 +9,9 @@ use axum::http::StatusCode;
 use futures_util::TryStreamExt;
 use libsubatomic::err::Res;
 use libsubatomic::prelude::Itertools;
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use tokio_util::io::StreamReader;
-
 pub async fn list_repos(State(pool): DbState) -> Result<Json<Vec<Repo>>> {
     Ok(Json(sqlx::query_as!(Repo, "SELECT * FROM repos ORDER BY name").fetch_all(&*pool).await?))
 }
@@ -122,7 +120,9 @@ impl UploadProcessor<'_> {
             //     .ok_or_else(|| ApiError::BadRequest("invalid utf8 filename".to_owned()))?;
             self.check_csum(multipart, &csum).await?;
             let frag = Self::parse_to_frag(&path, csum)?;
-            let path = path.strip_prefix(&self.dir).expect("rpm not in repodir");
+            let path = path
+                .strip_prefix(&self.dir)
+                .map_err(|_| ApiError::BadRequest("rpm not in repodir".into()))?;
             self.pkgs.push((path.as_os_str().as_bytes().to_owned(), frag));
             // self.out.push(serde_json::json!({
             //     "pkg": filename_str,
@@ -402,6 +402,10 @@ pub async fn del_rpms(
     Json(DelRpmsReq { rpms }): Json<DelRpmsReq>,
 ) -> Result<Json<serde_json::Value>> {
     repo_name(&repo)?;
+    for rpm in &rpms {
+        rpm_filename(rpm)?;
+    }
+
     tracing::info!(?rpms, "deleting rpms");
     let q = locker.write(&repo, async |repohdl| try bikeshed Result<_> {
         let out =
@@ -469,15 +473,15 @@ pub async fn del_md(
 
 #[cfg(test)]
 mod test {
-    use http_body_util::BodyExt;
-    use std::sync::Arc;
-    use tower::util::ServiceExt;
-
+    use crate::api::repos::StatusCode;
     use axum::extract::{Json, Path};
     use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
     use rust_multipart_rfc7578_2::client::multipart::{
         Body as MultipartBody, Form as MultipartForm,
     };
+    use std::sync::Arc;
+    use tower::util::ServiceExt;
 
     type Pool = sqlx::Pool<sqlx::Postgres>;
 
@@ -610,7 +614,78 @@ mod test {
         assert!(!new.exists());
         assert!(ret.get("not_found").unwrap().as_array().unwrap().is_empty());
     }
+    #[sqlx::test(fixtures("keys", "repos"))]
+    async fn upload_pkgs_rejects_path_traversal(pool: Pool) {
+        let states = app(pool);
+        let States { app, cfg, .. } = states;
 
+        let outside = cfg.storage_dir.join("escape-1-1.x86_64.rpm");
+        let absolute = "/tmp/pwn-1-1.x86_64.rpm";
+
+        let mut form = MultipartForm::default();
+        form.add_reader_2(
+            "../../escape-1-1.x86_64.rpm",
+            &b"not a real rpm"[..],
+            Some("../../escape-1-1.x86_64.rpm".into()),
+            None,
+            vec![],
+        );
+
+        let req = Request::post("/v1/repos/rpmfission")
+            .header("Authorization", AUTH)
+            .header(axum::http::header::CONTENT_TYPE, form.content_type().as_str())
+            .body(Body::from_stream(MultipartBody::from(form)))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(!outside.exists());
+
+        assert!(!std::path::Path::new(absolute).exists());
+        let mut form = MultipartForm::default();
+        form.add_reader_2(
+            "pwn-1-1.x86_64.rpm",
+            &b"not a real rpm"[..],
+            Some(absolute.into()),
+            None,
+            vec![],
+        );
+
+        let req = Request::post("/v1/repos/rpmfission")
+            .header("Authorization", AUTH)
+            .header(axum::http::header::CONTENT_TYPE, form.content_type().as_str())
+            .body(Body::from_stream(MultipartBody::from(form)))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(!std::path::Path::new(absolute).exists());
+
+        assert!(cfg.storage_dir.join("rpmfission").exists());
+    }
+    #[sqlx::test(fixtures("keys", "repos"))]
+    async fn del_rpms_rejects_path_traversal(pool: Pool) {
+        let states = app(pool);
+        let States { locker, cfg, .. } = states;
+
+        let outside = cfg.storage_dir.join("escape.rpm");
+        std::fs::write(&outside, b"must not be deleted").unwrap();
+
+        for rpm in ["../escape.rpm", "../../escape.rpm", "/tmp/pwn.rpm", "a/../escape.rpm"] {
+            let rpms = vec![rpm.to_string()];
+
+            let result = super::del_rpms(
+                locker.clone(),
+                Path("rpmfission".into()),
+                Json(super::DelRpmsReq { rpms }),
+            )
+            .await;
+
+            assert!(result.is_err(), "path should be rejected: {rpm}");
+        }
+
+        assert!(outside.exists());
+    }
     #[sqlx::test(fixtures("keys", "repos"))]
     async fn sign_headers(pool: Pool) {
         let states = app(pool);

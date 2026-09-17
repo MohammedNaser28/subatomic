@@ -10,7 +10,12 @@ pub fn repo_name(name: &str) -> Result<(), ApiError> {
             "repo name may only contain alphanumeric, '-', '_' and '.'".into(),
         ));
     }
-    if name.starts_with('.') || name.contains("..") || name.contains('/') || name.contains('\\') || name.contains('\0') {
+    if name.starts_with('.')
+        || name.contains("..")
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
         return Err(ApiError::BadRequest("repo name contains illegal sequence".into()));
     }
     Ok(())
@@ -68,7 +73,9 @@ mod tests {
     }
     #[test]
     fn rpm_filename_rejects_traversal() {
-        for bad in ["../../escape-1-1.x86_64.rpm", "/tmp/pwn.rpm", "a/b.rpm", "noext", "a..b.rpm", ""] {
+        for bad in
+            ["../../escape-1-1.x86_64.rpm", "/tmp/pwn.rpm", "a/b.rpm", "noext", "a..b.rpm", ""]
+        {
             assert!(rpm_filename(bad).is_err(), "{bad}");
         }
     }
